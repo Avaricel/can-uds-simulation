@@ -1,0 +1,57 @@
+VERSION "Cluster_Demo_1.0"
+
+BU_: BCM ECM ICM GW
+
+BO_ 200 IC_Dashboard: 8 ICM
+ SG_ EngineSpeed : 0|16@0+ (0.25,0) [0|16383.75] "rpm"  ECM,GW
+ SG_ VehicleSpeed : 16|16@0+ (0.01,0) [0|655.35] "km/h"  ECM,GW
+ SG_ CoolantTemp : 32|8@0+ (1,-40) [-40|215] "degC"  ECM,GW
+ SG_ FuelLevel : 40|8@0+ (0.4,0) [0|100] "%"  BCM,GW
+ SG_ Odometer : 48|24@0+ (1,0) [0|16777215] "km"  ICM
+
+BO_ 304 IC_Lamps: 6 ICM
+ SG_ TurnSignal : 0|2@0+ (1,0) [0|3] ""  GW
+ SG_ HighBeam : 2|1@0+ (1,0) [0|1] ""  GW
+ SG_ LowBeam : 3|1@0+ (1,0) [0|1] ""  GW
+ SG_ FogLight : 4|1@0+ (1,0) [0|1] ""  GW
+ SG_ BrakeLight : 5|1@0+ (1,0) [0|1] ""  GW
+ SG_ ParkingBrake : 6|1@0+ (1,0) [0|1] ""  GW
+
+BO_ 338 IC_GearInfo: 4 ICM
+ SG_ GearPosition : 0|4@0+ (1,0) [0|15] ""  ECM
+ SG_ GearShiftMode : 4|2@0+ (1,0) [0|3] ""  ECM
+ SG_ CurrentGear : 8|8@0+ (0.01,0) [0|2.55] ""  ECM
+ SG_ TransOilTemp : 16|8@0+ (1,-40) [-40|215] "degC"  ECM
+
+BO_ 420 IC_Doors: 2 ICM
+ SG_ DoorFrontLeft : 0|2@0+ (1,0) [0|3] ""  BCM
+ SG_ DoorFrontRight : 2|2@0+ (1,0) [0|3] ""  BCM
+ SG_ DoorRearLeft : 4|2@0+ (1,0) [0|3] ""  BCM
+ SG_ DoorRearRight : 6|2@0+ (1,0) [0|3] ""  BCM
+ SG_ Trunk : 8|2@0+ (1,0) [0|3] ""  BCM
+ SG_ Hood : 10|2@0+ (1,0) [0|3] ""  BCM
+
+BO_ 501 IC_DiagResp: 8 ICM
+ SG_ DiagResponseID : 0|8@0+ (1,0) [0|255] ""  GW
+ SG_ DiagSubFunc : 8|8@0+ (1,0) [0|255] ""  GW
+ SG_ DiagResult : 16|8@0+ (1,0) [0|255] ""  GW
+
+BO_ 566 IC_TPMS: 6 ICM
+ SG_ TPMS_FL_Pressure : 0|8@0+ (1,0) [0|255] "kPa"  GW
+ SG_ TPMS_FR_Pressure : 8|8@0+ (1,0) [0|255] "kPa"  GW
+ SG_ TPMS_RL_Pressure : 16|8@0+ (1,0) [0|255] "kPa"  GW
+ SG_ TPMS_RR_Pressure : 24|8@0+ (1,0) [0|255] "kPa"  GW
+ SG_ TPMS_Warning : 32|1@0+ (1,0) [0|1] ""  GW
+
+CM_ BO_ 200 "仪表盘显示信息 - 10ms周期";
+CM_ BO_ 304 "灯光状态 - 50ms周期";
+CM_ BO_ 338 "挡位信息 - 100ms周期";
+
+BA_DEF_ BO_ "GenMsgCycleTime";
+BA_ "GenMsgCycleTime" BO_ 200 10;
+BA_ "GenMsgCycleTime" BO_ 304 50;
+BA_ "GenMsgCycleTime" BO_ 338 100;
+
+VAL_ 338 GearPosition 0 "P档" 1 "R档" 2 "N档" 3 "D档";
+VAL_ 304 TurnSignal 0 "关闭" 1 "左转" 2 "右转" 3 "双闪";
+VAL_ 420 DoorFrontLeft 0 "关闭" 1 "半开" 2 "全开" 3 "故障";

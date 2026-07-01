@@ -1,65 +1,100 @@
-# CAN UDS ECU Simulation
+# 车载测试项目集
 
-基于 CAPL (CAN Access Programming Language) 实现的 UDS (Unified Diagnostic Services) ECU 仿真节点，用于 CANoe 环境下的车载诊断协议测试。
+车载测试方向的技术项目集合，涵盖 CAPL UDS 仿真、Python CAN 报文分析、自动化测试框架、车辆信号仿真。
 
-## 功能概述
+---
 
-### 支持的 UDS 服务
+## 项目列表
 
-| 服务ID | 服务名称 | 说明 |
-|--------|---------|------|
-| 0x10 | 诊断会话控制 | 支持默认/扩展/编程会话切换 |
-| 0x11 | ECU 复位 | 支持硬复位/软复位 |
-| 0x14 | 清除诊断信息 | 支持清除所有 DTC（需安全解锁） |
-| 0x19 | 读取 DTC 信息 | 支持按状态掩码报告 DTC 数量/列表 |
-| 0x22 | 按标识符读数据 | 支持 F18C（序列号）、F190（VIN）读取 |
-| 0x27 | 安全访问 | Seed/Key 安全解锁机制 |
-| 0x28 | 通信控制 | 禁止/恢复报文收发（需安全解锁） |
-| 0x2E | 按标识符写数据 | 支持 VIN/序列号写入（需安全解锁） |
-| 0x31 | 例程控制 | 支持 0x0203 硬件自检例程（需安全解锁） |
-| 0x34 | 请求下载 | 支持内存下载请求（需安全解锁） |
-| 0x36 | 传输数据 | 支持分块数据传输（需安全解锁） |
-| 0x37 | 请求退出传输 | 结束传输会话（需安全解锁） |
-| 0x3E | Tester Present | 会话保活 |
+### 1. [capl/](./capl/) — CAN UDS ECU 仿真 (CAPL)
 
-### 核心特性
+基于 CAPL 实现的 UDS 诊断协议 ECU 仿真节点，用于 CANoe 环境。
 
-- **ISO-TP 多帧传输**：支持超过 7 字节的 UDS 消息通过多帧协议传输
-- **安全访问控制**：Seed/Key 机制保护敏感服务（14/2E/28/31/34/36/37）
-- **VIN 写入支持**：支持 17 字节 ASCII 和 34 字节 HEX 文本两种格式
-- **DTC 管理**：预置 3 个故障码（P0420/B0341/C0121），支持状态掩码筛选
-- **会话超时**：默认 5 秒超时自动回退到默认会话
-- **通信控制**：支持 28 服务禁止/恢复通信
+| 技术 | 内容 |
+|------|------|
+| 语言 | CAPL |
+| 协议 | CAN, ISO-TP, UDS (ISO 14229) |
+| 工具 | Vector CANoe |
+| 代码量 | 1467 行 |
 
-## 项目结构
+**核心能力**: UDS 12 项服务实现、ISO-TP 多帧传输、Seed/Key 安全访问、DTC 管理
 
-```
-can-uds-simulation/
-├── README.md
-└── capl/
-    └── uds_ecu_simulation.can    # CAPL 源码
+---
+
+### 2. [can-message-analyzer/](./can-message-analyzer/) — CAN 报文解析与分析 (Python)
+
+Python 实现的 CAN 报文解析工具，支持 DBC 文件解析、CAN 日志解码、信号可视化。
+
+| 技术 | 内容 |
+|------|------|
+| 语言 | Python 3 |
+| 核心能力 | DBC 解析、Intel/Motorola 位序、信号值提取、图表输出 |
+| 代码量 | 1259 行 |
+
+```bash
+# 快速体验
+cd can-message-analyzer
+python examples/demo.py
 ```
 
-## 使用方式
+---
 
-1. 在 CANoe 中创建新工程
-2. 导入 `capl/uds_ecu_simulation.can` 作为仿真节点
-3. 配置节点 ID: ECU=0x601, 诊断仪=0x701
-4. 运行仿真，使用诊断仪发送 UDS 请求进行测试
+### 3. [auto-test-cli/](./auto-test-cli/) — 车载测试自动化 CLI (Python)
 
-## 技术栈
+车载测试命令行工具，集成 UDS 诊断、CAN 监控、测试用例管理、HTML 报告生成。
 
-- **语言**: CAPL (CAN Access Programming Language)
-- **协议**: CAN/CAN FD, ISO-TP (ISO 15765-2), UDS (ISO 14229)
-- **工具链**: Vector CANoe
+| 技术 | 内容 |
+|------|------|
+| 语言 | Python 3 |
+| 核心能力 | UDS 诊断客户端、DTC 读写、测试用例编排、HTML 测试报告 |
+| 代码量 | 1755 行 |
 
-## 面试相关
+```bash
+# 运行演示
+cd auto-test-cli
+python cli.py
+```
 
-本项目展示了以下车载测试核心能力：
+---
 
-- UDS 诊断协议理解（10/11/14/19/22/27/28/2E/31/34/36/37/3E）
-- ISO-TP 多帧传输（首帧/连续帧/流控制）
-- CAN 总线通信原理
-- 安全访问 Seed/Key 机制
-- DTC 故障码管理
-- Vector CANoe/CAPL 开发经验
+### 4. [vehicle-signal-simulator/](./vehicle-signal-simulator/) — 车辆信号仿真器 (Python)
+
+模拟发动机、变速箱、车身等 ECU 信号并通过 CAN 输出，支持故障注入。
+
+| 技术 | 内容 |
+|------|------|
+| 语言 | Python 3 |
+| 核心能力 | 发动机/变速箱/车身信号模型、CAN 帧封装、故障注入、日志导出 |
+| 代码量 | 1430 行 |
+
+```bash
+# 运行仿真
+cd vehicle-signal-simulator
+python cli.py run --duration 5 --rate 50
+```
+
+---
+
+## 技术栈总览
+
+| 技术领域 | 涉及内容 |
+|----------|---------|
+| 编程语言 | Python, CAPL |
+| 车载协议 | CAN/CAN FD, ISO-TP, UDS (ISO 14229) |
+| 工具链 | Vector CANoe, DBC |
+| 测试方法 | 自动化测试、测试用例管理、测试报告生成 |
+| 仿真 | ECU 仿真、信号建模、故障注入 |
+
+---
+
+## 面试价值
+
+四个项目覆盖车载测试面试中经常被问到的核心领域：
+
+- CAN 总线通信原理 + DBC 信号解析
+- UDS 诊断协议 (10/11/14/19/22/27/28/2E/31/34/36/37/3E)
+- ISO-TP 多帧传输机制
+- 安全访问 Seed/Key 流程
+- 自动化测试框架设计
+- Python 在车载测试中的应用
+- 信号仿真与故障注入
