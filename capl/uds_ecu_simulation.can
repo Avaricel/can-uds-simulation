@@ -1,0 +1,1467 @@
+/*@!Encoding:936*/
+// UDS诊断服务 - 完整版本（包含多帧传输支持）
+
+variables
+{
+  // ECU和诊断仪ID
+  const word ECU_ID = 0x601;
+  const word DIAG_ID = 0x701;
+  const byte DTC_STATUS_AVAILABILITY_MASK = 0xFF;
+  // 服务定义
+  const byte SID_REQUEST_DOWNLOAD = 0x34;    // 请求下载
+  const byte SID_TRANSFER_DATA = 0x36;       // 传输数据
+  const byte SID_REQUEST_TRANSFER_EXIT = 0x37; // 请求退出传输
+  
+  // 会话管理变量
+  byte currentSession;
+  const byte DEFAULT_SESSION = 0x01;
+  const byte PROGRAMMING_SESSION = 0x02;
+  const byte EXTENDED_SESSION = 0x03;
+  byte dataBytes;
+  byte blockSize;
+  byte separationTime;
+  
+  // NRC定义
+  const byte NRC_SERVICE_NOT_SUPPORTED = 0x11;
+  const byte NRC_INCORRECT_MESSAGE_LENGTH = 0x13;
+  const byte NRC_REQUEST_OUT_OF_RANGE = 0x31;
+  const byte NRC_SECURITY_ACCESS_DENIED = 0x33;
+  const byte NRC_INVALID_KEY = 0x35;
+  const byte NRC_CONDITIONS_NOT_CORRECT = 0x22;
+  const byte NRC_SUBFUNCTION_NOT_SUPPORTED = 0x12;
+  
+  message 0x601 firstFrame;
+  
+  // 会话超时相关
+  msTimer sessionTimer;
+  const long SESSION_TIMEOUT_MS = 5000;
+  byte sessionActive;
+  
+  // ISO-TP多帧传输相关
+  msTimer flowControlTimer;
+  byte multiFrameBuffer[4096];
+  word multiFrameLength;
+  byte multiFrameSent;
+  byte flowControlStatus;
+  const byte FLOW_STATUS_CONTINUE = 0x30;
+  const byte FLOW_STATUS_WAIT = 0x31;
+  const byte FLOW_STATUS_OVERFLOW = 0x32;
+  
+  // DID数据定义
+  byte serialNumber[12];      // F18C - 序列号 (12字节)
+  byte ecuIdentification[16]; // F189 - ECU识别信息 (16字节)
+  byte vinData[17];
+  // 19服务DTC相关变量
+  const byte MAX_DTC_COUNT = 10;
+  byte dtcCount;                    // 当前DTC数量
+  byte dtcList[10][4];             // DTC列表 [DTC高,DTC中,DTC低,状态]
+  byte dtcCleared;                  // DTC是否已被清除标记
+  byte confirmedDtcCount;           // 已确认DTC数量
+  byte pendingDtcCount;             // 待处理DTC数量
+  
+  // 28服务相关变量
+  byte communicationControlState;  // 0=正常，1=禁止接收，2=禁止发送，3=禁止收发
+  
+  // 通用变量
+  word did;
+  int i;
+  byte subFunction;
+  byte dataLength;
+  byte rawData[8];
+  byte udsService;
+  
+  // 27服务相关变量
+  byte seedData[8];
+  byte expectedKey[8];
+  byte seedLength;
+  int securityUnlocked;
+  int randomCounter;
+  byte receivedKey[8];
+  int keyValid;
+  byte keyLength;
+  byte responseData[64];
+  byte responseLen;
+  
+  // 当前待发送的多帧数据
+  byte pendingMultiFrameData[4096];
+  word pendingMultiFrameLen;
+  byte pendingMultiFrameIndex;
+  int pci;
+  int copyCount;
+  int bytesToSend;
+  word routineId;
+  byte statusMask;
+  byte groupMaskLow;
+  word groupMaskHigh;
+  
+  // 34/36/37服务相关变量
+  byte downloadInProgress;           // 下载进行中标志
+  dword memoryAddress;               // 当前内存地址
+  dword dataSize;                   // 数据总大小
+  dword transferredSize;            // 已传输大小
+  byte blockSequenceCounter;        // 块序列计数器
+  byte maxBlockLengthHigh;          // 最大块长度高字节
+  byte maxBlockLengthLow;           // 最大块长度低字节
+  byte dataBuffer[4096];            // 数据缓冲区
+  byte blockSequenceNumber;
+  byte simulatedMemory[8192];       // 8KB模拟内存
+  dword simulatedMemorySize;        // 模拟内存大小
+  int blockDataSize;
+  
+  // 多帧传输控制变量
+  byte consecutiveFrameNumber;
+  byte flowControlReceived;
+  byte blockSizeCF;
+  byte separationTimeMin;
+  byte canTpPadding;
+  
+      // ===== ISO-TP 接收侧（仅用于接收长请求）=====
+    byte tpRxInProgress;
+    word tpRxTotalLen;       // UDS payload总长度
+    word tpRxIndex;          // 已收payload长度
+    byte tpRxExpectedSN;     // 期望CF序号
+    byte tpRxBuffer[256];    // 请求重组缓冲
+
+}
+
+on start 
+{
+  write("仿真ECU启动 - ECU ID: 0x%03X, 诊断仪ID: 0x%03X", ECU_ID, DIAG_ID);
+  write("支持服务: 10, 11, 14, 19, 22, 27, 28, 2E, 31, 3E, 34, 36, 37");
+  write("支持多帧传输: 19服务, 22服务等长数据响应");
+  write("安全要求: 14/2E/28/31/34/36/37服务需要27服务解锁");
+  write("19/22服务无需解锁");
+  write("19服务: 01=读取DTC数量, 02=读取DTC列表");
+  write("14服务: FF FF FF=清除所有DTC (需要解锁)");
+  write("34服务: 专门处理请求 34 00 31 20 20 20 10");
+  
+  // 初始化会话状态
+  currentSession = DEFAULT_SESSION;
+  sessionActive = 1;
+  
+  // 初始化DID数据
+  // 初始化DID数据
+// F18C - Serial Number (12字节，ASCII格式)
+  serialNumber[0] = 'E'; serialNumber[1] = 'C'; serialNumber[2] = 'U'; serialNumber[3] = '_';
+  serialNumber[4] = 'S'; serialNumber[5] = 'N'; serialNumber[6] = '0'; serialNumber[7] = '0';
+  serialNumber[8] = '1'; serialNumber[9] = '2'; serialNumber[10] = '3'; serialNumber[11] = '4';
+
+  // F190 - VIN = HLX32B144S1162516
+  vinData[0]  = 'H';
+  vinData[1]  = 'L';
+  vinData[2]  = 'X';
+  vinData[3]  = '3';
+  vinData[4]  = '2';
+  vinData[5]  = 'B';
+  vinData[6]  = '1';
+  vinData[7]  = '4';
+  vinData[8]  = '4';
+  vinData[9]  = 'S';
+  vinData[10] = '1';
+  vinData[11] = '1';
+  vinData[12] = '6';
+  vinData[13] = '2';
+  vinData[14] = '5';
+  vinData[15] = '1';
+  vinData[16] = '6';
+  
+  // F189 - ECU Identification (16字节)
+  ecuIdentification[0] = 0x01;  // 硬件版本主
+  ecuIdentification[1] = 0x02;  // 硬件版本次
+  ecuIdentification[2] = 0x03;  // 软件版本主
+  ecuIdentification[3] = 0x04;  // 软件版本次
+  ecuIdentification[4] = 0x05;  // 生产日期年
+  ecuIdentification[5] = 0x06;  // 生产日期月
+  ecuIdentification[6] = 0x07;  // 生产日期日
+  ecuIdentification[7] = 0x08;  // 供应商代码1
+  ecuIdentification[8] = 0x09;  // 供应商代码2
+  ecuIdentification[9] = 0x0A;  // ECU型号1
+  ecuIdentification[10] = 0x0B; // ECU型号2
+  ecuIdentification[11] = 0x0C; // 校准版本
+  ecuIdentification[12] = 0x0D; // 备件号1
+  ecuIdentification[13] = 0x0E; // 备件号2
+  ecuIdentification[14] = 0x0F; // 备件号3
+  ecuIdentification[15] = 0x10; // 备件号4
+  
+  // 初始化19服务DTC数据
+  initializeDTCData();
+  
+  // 初始化28服务状态
+  communicationControlState = 0;  // 初始状态：正常通信
+  
+  // 初始化27服务变量
+  seedLength = 2;
+  securityUnlocked = 0;
+  randomCounter = 0;
+  
+  // 初始化34/36/37服务变量
+  downloadInProgress = 0;
+  memoryAddress = 0;
+  dataSize = 0;
+  transferredSize = 0;
+  blockSequenceCounter = 0;
+  maxBlockLengthHigh = 0x0F;  // 最大块长度高字节
+  maxBlockLengthLow = 0xFF;    // 最大块长度低字节=4095
+  
+  // 初始化模拟内存
+  simulatedMemorySize = 8192;
+  for(i = 0; i < simulatedMemorySize; i++) {
+    simulatedMemory[i] = (i % 256) & 0xFF;  // 填充测试数据
+  }
+  
+  // 初始化多帧传输状态
+  pendingMultiFrameLen = 0;
+  pendingMultiFrameIndex = 0;
+  consecutiveFrameNumber = 1;
+  flowControlReceived = 0;
+  blockSizeCF = 8;      // 块大小
+  separationTimeMin = 0; // 分离时间
+  
+  // 启动会话定时器
+  setTimer(sessionTimer, SESSION_TIMEOUT_MS);
+  
+  write("模拟内存初始化完成: %d字节", simulatedMemorySize);
+  write("DTC数据初始化完成: 总数=%d, 已确认=%d, 待处理=%d", dtcCount, confirmedDtcCount, pendingDtcCount);
+  write("多帧传输支持已启用");
+  write("数据传输服务就绪");
+}
+byte hexCharToNibble(byte c)
+{
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  return 0xFF;
+}
+
+// 将17字节ASCII VIN转换为34字节HEX文本（每字节两位ASCII十六进制）
+// outHexBuf 需至少34字节
+void vinAsciiToHexText(byte asciiVin[], byte outHexBuf[])
+{
+  byte hi, lo, v;
+  for (i = 0; i < 17; i++) {
+    v = asciiVin[i];
+    hi = (v >> 4) & 0x0F;
+    lo = v & 0x0F;
+    outHexBuf[i * 2]     = (hi < 10) ? ('0' + hi) : ('A' + hi - 10);
+    outHexBuf[i * 2 + 1] = (lo < 10) ? ('0' + lo) : ('A' + lo - 10);
+  }
+}
+
+
+
+void sendFlowControlCTS()
+{
+  message 0x601 fcMsg;
+  fcMsg.dlc = 8;
+  fcMsg.byte(0) = 0x30; // FC, ContinueToSend
+  fcMsg.byte(1) = 0x00; // BS=0
+  fcMsg.byte(2) = 0x00; // STmin=0
+  fcMsg.byte(3) = 0x00;
+  fcMsg.byte(4) = 0x00;
+  fcMsg.byte(5) = 0x00;
+  fcMsg.byte(6) = 0x00;
+  fcMsg.byte(7) = 0x00;
+  output(fcMsg);
+  write("TX FC: 30 00 00");
+}
+
+void send2EF190PositiveResponse()
+{
+  responseData[0] = 0x6E;
+  responseData[1] = 0xF1;
+  responseData[2] = 0x90;
+  sendIsoTpPositiveResponse(responseData, 3);
+  write("TX: 6E F1 90");
+}
+
+void handle2EF190FromTpBuffer()
+{
+  byte vinLen;
+  byte iLocal;
+  byte hi, lo;
+  byte tmpVin[17];
+
+  // UDS payload格式: 2E F1 90 [data...]
+  if (tpRxTotalLen < 3) {
+    sendIsoTpNegativeResponse(0x2E, NRC_INCORRECT_MESSAGE_LENGTH);
+    return;
+  }
+
+  if (!(tpRxBuffer[0] == 0x2E && tpRxBuffer[1] == 0xF1 && tpRxBuffer[2] == 0x90)) {
+    // 非2E F190，按你原逻辑处理（这里简单返回NRC）
+    sendIsoTpNegativeResponse(0x2E, NRC_REQUEST_OUT_OF_RANGE);
+    return;
+  }
+
+  vinLen = tpRxTotalLen - 3;
+
+  // 支持17字节ASCII，或34字节HEX文本
+  if (vinLen == 17) {
+    for (iLocal = 0; iLocal < 17; iLocal++) {
+      tmpVin[iLocal] = tpRxBuffer[3 + iLocal];
+    }
+  } else if (vinLen == 34) {
+    for (iLocal = 0; iLocal < 17; iLocal++) {
+      hi = hexCharToNibble(tpRxBuffer[3 + iLocal * 2]);
+      lo = hexCharToNibble(tpRxBuffer[3 + iLocal * 2 + 1]);
+      if (hi == 0xFF || lo == 0xFF) {
+        sendIsoTpNegativeResponse(0x2E, NRC_REQUEST_OUT_OF_RANGE);
+        return;
+      }
+      tmpVin[iLocal] = (hi << 4) | lo;
+    }
+  } else {
+    sendIsoTpNegativeResponse(0x2E, NRC_INCORRECT_MESSAGE_LENGTH);
+    return;
+  }
+
+  // 提交VIN
+  for (iLocal = 0; iLocal < 17; iLocal++) {
+    vinData[iLocal] = tmpVin[iLocal];
+  }
+
+  write("VIN updated: %c%c%c%c%c%c%c%c%c%c%c%c%c%c%c%c%c",
+        vinData[0], vinData[1], vinData[2], vinData[3], vinData[4], vinData[5],
+        vinData[6], vinData[7], vinData[8], vinData[9], vinData[10], vinData[11],
+        vinData[12], vinData[13], vinData[14], vinData[15], vinData[16]);
+
+  send2EF190PositiveResponse();
+}
+
+// 将34字节HEX文本转换为17字节ASCII VIN
+// 成功返回1，失败返回0
+byte vinHexTextToAscii(byte hexText[], byte outAsciiVin[])
+{
+  byte hi, lo;
+  for (i = 0; i < 17; i++) {
+    hi = hexCharToNibble(hexText[i * 2]);
+    lo = hexCharToNibble(hexText[i * 2 + 1]);
+    if (hi == 0xFF || lo == 0xFF) {
+      return 0;
+    }
+    outAsciiVin[i] = (hi << 4) | lo;
+  }
+  return 1;
+}
+
+// ========== 初始化DTC数据 ==========
+void initializeDTCData()
+{
+  // 初始化3个DTC故障码
+  dtcCount = 3;
+  dtcCleared = 0;
+  
+
+ // DTC 1: P0420
+dtcList[0][0] = 0x04;
+dtcList[0][1] = 0x20;
+dtcList[0][2] = 0x00;
+dtcList[0][3] = 0x09;
+// DTC 2: B0341
+dtcList[1][0] = 0x83;
+dtcList[1][1] = 0x41;
+dtcList[1][2] = 0x00;
+dtcList[1][3] = 0x0A;
+// DTC 3: C0121
+dtcList[2][0] = 0x41;
+dtcList[2][1] = 0x21;
+dtcList[2][2] = 0x00;
+dtcList[2][3] = 0x09;
+  
+  // 计算DTC数量统计
+  updateDTCCounts();
+  
+  write("DTC数据初始化完成: 总数=%d, 已确认=%d, 待处理=%d", dtcCount, confirmedDtcCount, pendingDtcCount);
+}
+
+// ========== 更新DTC数量统计 ==========
+void updateDTCCounts()
+{
+  confirmedDtcCount = 0;
+  pendingDtcCount = 0;
+  
+  for(i = 0; i < dtcCount; i++) {
+    if ((dtcList[i][3] & 0x08) != 0) {  // 检查已确认位 (Bit3)
+      confirmedDtcCount++;
+    }
+    if ((dtcList[i][3] & 0x10) != 0) {  // 检查待处理位 (Bit4)
+      pendingDtcCount++;
+    }
+  }
+}
+
+// ========== 14服务 - 清除诊断信息 (需要解锁) ==========
+void handleClearDiagnosticInformation()
+{
+  write(">>> 处理14服务请求");
+  
+  // 检查安全访问是否已解锁
+  if (securityUnlocked == 0) {
+    write("14服务: 安全访问未解锁，拒绝执行");
+    sendIsoTpNegativeResponse(0x14, NRC_SECURITY_ACCESS_DENIED);
+    return;
+  }
+  
+  if (dataLength < 4) {
+    sendIsoTpNegativeResponse(0x14, NRC_INCORRECT_MESSAGE_LENGTH);
+    return;
+  }
+  
+  // 提取DTC组掩码 (3字节)
+  groupMaskHigh = (rawData[2] << 8) | rawData[3];
+  groupMaskLow = rawData[4];
+  
+  write("14服务请求: DTC组掩码=0x%02X%02X%02X", rawData[2], rawData[3], rawData[4]);
+  
+  // 检查是否为清除所有DTC (0xFFFFFF)
+  if (rawData[2] == 0xFF && rawData[3] == 0xFF && rawData[4] == 0xFF) {
+    // 清除所有DTC
+    dtcCount = 0;
+    dtcCleared = 1;
+    updateDTCCounts();
+    
+    write("*** 清除所有DTC成功! DTC数量: 3 -> 0 ***");
+    write("*** 所有故障码已被清除 ***");
+    
+    // 发送正响应
+    responseData[0] = 0x01;  // 响应长度
+    responseData[1] = 0x54;  // SID+0x40
+    responseLen = 2;
+    sendIsoTpPositiveResponseSingleFrame(responseData, responseLen);
+  } else {
+    write("14服务: 不支持的DTC组掩码");
+    sendIsoTpNegativeResponse(0x14, NRC_REQUEST_OUT_OF_RANGE);
+  }
+}
+
+// ========== 19服务 - 读取DTC信息 (无需解锁) ==========
+void handleReadDTCInformation()
+{
+  write(">>> 处理19服务请求");
+  
+  if (dataLength < 2) {
+    sendIsoTpNegativeResponse(0x19, NRC_INCORRECT_MESSAGE_LENGTH);
+    return;
+  }
+  
+  subFunction = rawData[2];
+  write("19服务请求: 子功能=0x%02X", subFunction);
+  
+  switch(subFunction) {
+    case 0x01:  // 报告DTC数量
+      handleReportDTCNumber();
+      break;
+      
+    case 0x02:  // 按状态掩码报告DTC
+      handleReportDTCByStatusMask();
+      break;
+      
+    case 0x04:  // 报告DTC快照标识符
+    case 0x06:  // 报告扩展数据记录标识符
+    case 0x0A:  // 报告DTC严重程度
+    default:
+      write("19 %02X: 不支持的子功能", subFunction);
+      sendIsoTpNegativeResponse(0x19, NRC_SUBFUNCTION_NOT_SUPPORTED);
+      return;
+  }
+}
+
+// ========== 19 01 - reportNumberOfDTCByStatusMask ==========
+void handleReportDTCNumber()
+{
+  word matchCount;
+
+  // 请求最少: 19 01 [DTCStatusMask]
+  if (dataLength < 3) {
+    sendIsoTpNegativeResponse(0x19, NRC_INCORRECT_MESSAGE_LENGTH);
+    return;
+  }
+
+  statusMask = rawData[3];
+  write("19 01: reportNumberOfDTCByStatusMask, mask=0x%02X", statusMask);
+
+  matchCount = 0;
+
+  // 未清码时，按掩码统计匹配数量
+  if (dtcCleared != 1) {
+    for (i = 0; i < dtcCount; i++) {
+      if ((dtcList[i][3] & statusMask) != 0) {
+        matchCount++;
+      }
+    }
+  }
+
+  // 正响应格式:
+  // 59 01 [DTCStatusAvailabilityMask] [DTCFormatIdentifier] [DTCCountHi] [DTCCountLo]
+  responseData[0] = 0x59;  // SID + 0x40
+  responseData[1] = 0x01;  // 子功能
+  responseData[2] = DTC_STATUS_AVAILABILITY_MASK; // 建议 0xFF
+  responseData[3] = 0x00;        // 0x00 (ISO 15031-6 / SAE J2012)
+  responseData[4] = (matchCount >> 8) & 0xFF;     // 高字节
+  responseData[5] = matchCount & 0xFF;            // 低字节
+  responseLen = 6;
+
+  write("19 01 response: 59 01 %02X %02X %02X %02X",
+        responseData[2], responseData[3], responseData[4], responseData[5]);
+
+  sendIsoTpPositiveResponse(responseData, responseLen);
+}
+
+// ========== 19 02 - reportDTCByStatusMask ==========
+void handleReportDTCByStatusMask()
+{
+  // 请求最少: 19 02 [DTCStatusMask]
+  if (dataLength < 3) {
+    sendIsoTpNegativeResponse(0x19, NRC_INCORRECT_MESSAGE_LENGTH);
+    return;
+  }
+
+  statusMask = rawData[3];
+  write("19 02: reportDTCByStatusMask, mask=0x%02X", statusMask);
+
+  if (dtcCleared == 1) {
+    // 清码后返回空列表，但仍带 DTCStatusAvailabilityMask
+    responseData[0] = 0x59;  // SID + 0x40
+    responseData[1] = 0x02;  // 子功能
+    responseData[2] = DTC_STATUS_AVAILABILITY_MASK; // 建议 0xFF
+    responseLen = 3;
+  } else {
+    byte matchingDtcCount = 0;
+    byte dtcBuffer[40]; // 最多10条，每条4字节(DTC3字节 + 状态1字节)
+
+    // 按状态掩码筛选
+    for (i = 0; i < dtcCount; i++) {
+      if ((dtcList[i][3] & statusMask) != 0) {
+        dtcBuffer[matchingDtcCount * 4]     = dtcList[i][0]; // DTC高
+        dtcBuffer[matchingDtcCount * 4 + 1] = dtcList[i][1]; // DTC中
+        dtcBuffer[matchingDtcCount * 4 + 2] = dtcList[i][2]; // DTC低
+        dtcBuffer[matchingDtcCount * 4 + 3] = dtcList[i][3]; // DTC状态
+        matchingDtcCount++;
+
+        if (matchingDtcCount >= 10) {
+          break;
+        }
+      }
+    }
+
+    responseData[0] = 0x59;
+    responseData[1] = 0x02;
+    responseData[2] = DTC_STATUS_AVAILABILITY_MASK; // 建议 0xFF
+    responseLen = 3;
+
+    for (i = 0; i < matchingDtcCount * 4; i++) {
+      responseData[responseLen] = dtcBuffer[i];
+      responseLen++;
+    }
+
+    write("19 02: matched DTC count=%d", matchingDtcCount);
+  }
+
+  write("19 02 response payload length=%d", responseLen);
+  sendIsoTpPositiveResponse(responseData, responseLen);
+}
+
+// ========== 10服务 - 诊断会话控制 ==========
+void handleSessionControl()
+{
+  if (dataLength < 2) {
+    sendIsoTpNegativeResponse(0x10, NRC_INCORRECT_MESSAGE_LENGTH);
+    return;
+  }
+  
+  subFunction = rawData[2];
+  write("10服务请求: 子功能=0x%02X, 当前会话=0x%02X", subFunction, currentSession);
+  
+  switch(subFunction) {
+    case DEFAULT_SESSION:
+      currentSession = DEFAULT_SESSION;
+      write("10 01: 切换到默认会话");
+      break;
+      
+    case EXTENDED_SESSION:
+      currentSession = EXTENDED_SESSION;
+      write("10 03: 切换到扩展会话");
+      break;
+      
+    case PROGRAMMING_SESSION:
+      if (currentSession == EXTENDED_SESSION) {
+        currentSession = PROGRAMMING_SESSION;
+        write("10 02: 切换到编程会话 (从扩展会话)");
+      } else if (currentSession == DEFAULT_SESSION) {
+        write("10 02: 条件不正确 - 需要先从默认会话切换到扩展会话");
+        sendIsoTpNegativeResponse(0x10, NRC_CONDITIONS_NOT_CORRECT);
+        return;
+      } else {
+        write("10 02: 不支持的会话切换路径");
+        sendIsoTpNegativeResponse(0x10, NRC_CONDITIONS_NOT_CORRECT);
+        return;
+      }
+      break;
+      
+    default:
+      write("10 %02X: 不支持的子功能", subFunction);
+      sendIsoTpNegativeResponse(0x10, 0x12);
+      return;
+  }
+  
+  // 发送正响应
+  responseData[0] = 0x02;  // 响应长度
+  responseData[1] = 0x50;  // SID+0x40
+  responseData[2] = subFunction;
+  responseLen = 3;
+  sendIsoTpPositiveResponse(responseData, responseLen);
+}
+
+// ========== 22服务 - 按标识符读数据 (无需解锁) ==========
+void handleReadDataByIdentifier()
+{
+  write(">>> 处理22服务请求");
+  
+  if (dataLength < 3) {
+    sendIsoTpNegativeResponse(0x22, NRC_INCORRECT_MESSAGE_LENGTH);
+    return;
+  }
+  
+  did = (rawData[2] << 8) | rawData[3];
+  responseLen = 0;
+  
+  write("请求DID: 0x%04X", did);
+  
+  switch(did) {
+    case 0xF18C:  // Serial Number Read
+      responseData[0] = 0x62;
+      responseData[1] = 0xF1;
+      responseData[2] = 0x8C;
+      for(i = 0; i < 12; i++) responseData[3 + i] = serialNumber[i];
+      responseLen = 15;  // 3字节头 + 12字节数据
+      write("22 F18C: 返回完整序列号 (12字节)");
+      break;
+      
+    case 0xF190:  // VIN Read
+      responseData[0] = 0x62;
+      responseData[1] = 0xF1;
+      responseData[2] = 0x90;
+      for(i = 0; i < 17; i++) responseData[3 + i] = vinData[i];
+      responseLen = 20;  // 3字节头 + 17字节VIN
+      write("22 F190: 返回VIN ASCII(17字节): HLX32B144S1162516");
+      break;
+      
+    default:
+      write("22 %04X: 不支持的DID", did);
+      sendIsoTpNegativeResponse(0x22, NRC_REQUEST_OUT_OF_RANGE);
+      return;
+  }
+  
+  write("22服务响应: 总长度=%d字节", responseLen);
+  sendIsoTpPositiveResponse(responseData, responseLen);
+}
+
+// ========== 2E服务 - 按标识符写数据 (需要解锁) ==========
+void handleWriteDataByIdentifier()
+{
+  write(">>> 处理2E服务请求");
+  
+  if (securityUnlocked == 0) {
+    write("2E服务: 安全访问未解锁，拒绝执行");
+    sendIsoTpNegativeResponse(0x2E, NRC_SECURITY_ACCESS_DENIED);
+    return;
+  }
+  
+  if (dataLength < 4) {
+    sendIsoTpNegativeResponse(0x2E, NRC_INCORRECT_MESSAGE_LENGTH);
+    return;
+  }
+  
+  did = (rawData[2] << 8) | rawData[3];
+  write("2E服务请求: DID=0x%04X", did);
+  
+  switch(did) {
+    case 0xF18C:
+      if (dataLength >= 5) {
+        dataBytes = dataLength - 3;
+        if (dataBytes > 12) dataBytes = 12;
+        for(i = 0; i < dataBytes; i++) serialNumber[i] = rawData[4 + i];
+        write("*** 序列号标定成功 (F18C): %d字节已更新 ***", dataBytes);
+      }
+      break;
+      
+    case 0xF190:
+{
+  // F190 VIN: 支持两种写法
+  // 1) 17字节ASCII VIN
+  // 2) 34字节HEX文本（每2个HEX字符表示1个VIN字符）
+  byte vinLen;
+  byte isHexText;
+  byte idx;
+  byte hi;
+  byte lo;
+  byte ch;
+  byte tmpVin[17];
+
+  if (dataLength < 4) {
+    sendIsoTpNegativeResponse(0x2E, NRC_INCORRECT_MESSAGE_LENGTH);
+    return;
+  }
+
+  vinLen = dataLength - 3;  // 去掉 SID(1) + DID(2)
+
+  if (vinLen != 17 && vinLen != 34) {
+    write("F190写入失败: VIN长度必须为17(ASCII)或34(HEX文本), 当前=%d", vinLen);
+    sendIsoTpNegativeResponse(0x2E, NRC_INCORRECT_MESSAGE_LENGTH);
+    return;
+  }
+
+  // 判断是否为HEX文本（仅在34字节时）
+  isHexText = (vinLen == 34);
+
+  if (!isHexText) {
+    // 17字节ASCII VIN
+    for (idx = 0; idx < 17; idx++) {
+      ch = rawData[4 + idx];
+
+      // VIN常见约束：A-Z / 0-9，不允许 I/O/Q
+      if (!((ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9'))) {
+        write("F190写入失败: ASCII VIN含非法字符 idx=%d val=0x%02X", idx, ch);
+        sendIsoTpNegativeResponse(0x2E, NRC_REQUEST_OUT_OF_RANGE);
+        return;
+      }
+      if (ch == 'I' || ch == 'O' || ch == 'Q') {
+        write("F190写入失败: ASCII VIN不允许 I/O/Q idx=%d val=%c", idx, ch);
+        sendIsoTpNegativeResponse(0x2E, NRC_REQUEST_OUT_OF_RANGE);
+        return;
+      }
+
+      tmpVin[idx] = ch;
+    }
+  } else {
+    // 34字节HEX文本 -> 17字节ASCII VIN
+    for (idx = 0; idx < 17; idx++) {
+      hi = rawData[4 + idx * 2];
+      lo = rawData[4 + idx * 2 + 1];
+
+      if (hi >= '0' && hi <= '9') hi = hi - '0';
+      else if (hi >= 'A' && hi <= 'F') hi = hi - 'A' + 10;
+      else if (hi >= 'a' && hi <= 'f') hi = hi - 'a' + 10;
+      else {
+        write("F190写入失败: HEX高半字节非法 idx=%d", idx);
+        sendIsoTpNegativeResponse(0x2E, NRC_REQUEST_OUT_OF_RANGE);
+        return;
+      }
+
+      if (lo >= '0' && lo <= '9') lo = lo - '0';
+      else if (lo >= 'A' && lo <= 'F') lo = lo - 'A' + 10;
+      else if (lo >= 'a' && lo <= 'f') lo = lo - 'a' + 10;
+      else {
+        write("F190写入失败: HEX低半字节非法 idx=%d", idx);
+        sendIsoTpNegativeResponse(0x2E, NRC_REQUEST_OUT_OF_RANGE);
+        return;
+      }
+
+      ch = (hi << 4) | lo;
+
+      // 转出来仍按VIN字符规则校验
+      if (!((ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9'))) {
+        write("F190写入失败: HEX转ASCII后非法 idx=%d val=0x%02X", idx, ch);
+        sendIsoTpNegativeResponse(0x2E, NRC_REQUEST_OUT_OF_RANGE);
+        return;
+      }
+      if (ch == 'I' || ch == 'O' || ch == 'Q') {
+        write("F190写入失败: HEX转ASCII后包含 I/O/Q idx=%d", idx);
+        sendIsoTpNegativeResponse(0x2E, NRC_REQUEST_OUT_OF_RANGE);
+        return;
+      }
+
+      tmpVin[idx] = ch;
+    }
+  }
+
+  // 校验通过后一次性提交
+  for (idx = 0; idx < 17; idx++) {
+    vinData[idx] = tmpVin[idx];
+  }
+
+  write("F190写入成功: %c%c%c%c%c%c%c%c%c%c%c%c%c%c%c%c%c",
+        vinData[0], vinData[1], vinData[2], vinData[3], vinData[4], vinData[5],
+        vinData[6], vinData[7], vinData[8], vinData[9], vinData[10], vinData[11],
+        vinData[12], vinData[13], vinData[14], vinData[15], vinData[16]);
+  break;
+}
+      
+    default:
+      write("2E %04X: 不支持的DID", did);
+      sendIsoTpNegativeResponse(0x2E, NRC_REQUEST_OUT_OF_RANGE);
+      return;
+  }
+  
+  responseData[0] = 0x6E;
+  responseData[1] = (did >> 8) & 0xFF;
+  responseData[2] = did & 0xFF;
+  responseLen = 3;
+  sendIsoTpPositiveResponse(responseData, responseLen);
+}
+
+// ========== 27服务处理函数 ==========
+void handleSecurityAccess()
+{
+  if (dataLength < 2) {
+    sendIsoTpNegativeResponse(0x27, NRC_INCORRECT_MESSAGE_LENGTH);
+    return;
+  }
+  
+  subFunction = rawData[2] & 0x7F;
+  
+  if (subFunction == 0x01) {
+    handleSeedRequest();
+  } else if (subFunction == 0x02) {
+    handleKeyVerification();
+  } else {
+    sendIsoTpNegativeResponse(0x27, 0x12);
+  }
+}
+
+void handleSeedRequest()
+{
+  write(">>> 处理27 01请求");
+  seedLength = 2;
+  generateRandomSeed();
+  write("生成种子: %02X %02X", seedData[0], seedData[1]);
+  generateExpectedKey();
+  write("预期密钥: %02X %02X", expectedKey[0], expectedKey[1]);
+  
+  responseData[0] = 0x67;
+  responseData[1] = 0x01;
+  responseData[2] = seedData[0];
+  responseData[3] = seedData[1];
+  responseLen = 4;
+  securityUnlocked = 0;
+  sendIsoTpPositiveResponse(responseData, responseLen);
+}
+
+void handleKeyVerification()
+{
+  write(">>> 处理27 02请求");
+  if (dataLength < 3) {
+    sendIsoTpNegativeResponse(0x27, NRC_INCORRECT_MESSAGE_LENGTH);
+    return;
+  }
+  
+  keyLength = dataLength - 2;
+  for (i = 0; i < keyLength && i < 8; i++) receivedKey[i] = rawData[3 + i];
+  write("接收密钥: %02X %02X", receivedKey[0], receivedKey[1]);
+  
+  keyValid = 1;
+  for (i = 0; i < seedLength; i++) {
+    if (receivedKey[i] != expectedKey[i]) {
+      keyValid = 0;
+      write("密钥验证失败: 位置%d 收到0x%02X 预期0x%02X", i, receivedKey[i], expectedKey[i]);
+      break;
+    }
+  }
+  
+  if (keyValid == 1) {
+    securityUnlocked = 1;
+    write("*** 密钥验证成功! 安全等级解锁 ***");
+    responseData[0] = 0x67;
+    responseData[1] = 0x02;
+    responseLen = 2;
+    sendIsoTpPositiveResponse(responseData, responseLen);
+  } else {
+    sendIsoTpNegativeResponse(0x27, NRC_INVALID_KEY);
+  }
+}
+
+void generateRandomSeed()
+{
+  randomCounter++;
+  seedData[0] = (0x10 + randomCounter * 3) & 0xFF;
+  seedData[1] = (0x20 + randomCounter * 7) & 0xFF;
+  for (i = 0; i < seedLength; i++) if (seedData[i] == 0x00) seedData[i] = 0x01;
+}
+
+void generateExpectedKey()
+{
+  for (i = 0; i < seedLength; i++) expectedKey[i] = ~seedData[i];
+}
+
+// ========== 28服务处理函数 ==========
+void handleCommunicationControl()
+{
+  write(">>> 处理28服务请求");
+  
+  if (securityUnlocked == 0) {
+    write("28服务: 安全访问未解锁，拒绝执行");
+    sendIsoTpNegativeResponse(0x28, NRC_SECURITY_ACCESS_DENIED);
+    return;
+  }
+  
+  if (dataLength < 2) {
+    sendIsoTpNegativeResponse(0x28, NRC_INCORRECT_MESSAGE_LENGTH);
+    return;
+  }
+  
+  subFunction = rawData[2] & 0x7F;
+  write("28服务请求: 子功能=0x%02X", subFunction);
+  
+  switch(subFunction) {
+    case 0x00:
+      communicationControlState = 0;
+      write("28 00: 恢复报文接收和发送");
+      break;
+      
+    case 0x03:
+      communicationControlState = 3;
+      write("28 03: 禁止报文接收和发送");
+      break;
+      
+    default:
+      write("28 %02X: 不支持的子功能", subFunction);
+      sendIsoTpNegativeResponse(0x28, 0x12);
+      return;
+  }
+  
+  responseData[0] = 0x68;
+  responseData[1] = subFunction;
+  responseLen = 2;
+  sendIsoTpPositiveResponse(responseData, responseLen);
+}
+
+// ========== 31服务处理函数 ==========
+void handleRoutineControl()
+{
+  write(">>> 处理31服务请求");
+  
+  if (securityUnlocked == 0) {
+    write("31服务: 安全访问未解锁，拒绝执行");
+    sendIsoTpNegativeResponse(0x31, NRC_SECURITY_ACCESS_DENIED);
+    return;
+  }
+  
+  if (dataLength < 3) {
+    sendIsoTpNegativeResponse(0x31, NRC_INCORRECT_MESSAGE_LENGTH);
+    return;
+  }
+  
+  subFunction = rawData[2];
+  routineId = (rawData[3] << 8) | rawData[4];
+  write("31服务请求: 子功能=0x%02X, 例程ID=0x%04X", subFunction, routineId);
+  
+  if (routineId != 0x0203) {
+    write("31服务: 不支持的例程ID 0x%04X", routineId);
+    sendIsoTpNegativeResponse(0x31, NRC_REQUEST_OUT_OF_RANGE);
+    return;
+  }
+  
+  write("正在执行硬件自检操作...");
+  write("硬件自检完成，所有测试通过");
+  
+  responseData[0] = 0x71;
+  responseData[1] = subFunction;
+  responseData[2] = 0x02;
+  responseData[3] = 0x03;
+  responseData[4] = 0x00;
+  responseData[5] = 0x01;
+  responseLen = 6;
+  sendIsoTpPositiveResponse(responseData, responseLen);
+}
+
+// ========== 34服务 - 请求下载 (需要解锁) ==========
+void handleRequestDownload()
+{
+  write(">>> 处理34服务 - 请求下载");
+  
+  // 检查安全访问是否已解锁
+  if (securityUnlocked == 0) {
+    write("34服务: 安全访问未解锁，拒绝执行");
+    sendIsoTpNegativeResponse(SID_REQUEST_DOWNLOAD, NRC_SECURITY_ACCESS_DENIED);
+    return;
+  }
+  
+  // 检查是否是固定的请求: 34 00 31 20 20 20 10
+  if (dataLength != 7) {  // 请求总长度应该是7字节 (SID+数据)
+    write("34服务错误: 请求长度不是7字节，收到%d字节", dataLength);
+    write("期望: 34 00 31 20 20 20 10");
+    sendIsoTpNegativeResponse(SID_REQUEST_DOWNLOAD, NRC_INCORRECT_MESSAGE_LENGTH);
+    return;
+  }
+  
+  // 检查是否是我们要处理的请求
+  if (rawData[1] != 0x34 || rawData[2] != 0x00 || rawData[3] != 0x31) {
+    write("34服务错误: 不是指定的请求格式");
+    write("期望: 34 00 31 ...");
+    write("收到: %02X %02X %02X ...", rawData[1], rawData[2], rawData[3]);
+    sendIsoTpNegativeResponse(SID_REQUEST_DOWNLOAD, NRC_REQUEST_OUT_OF_RANGE);
+    return;
+  }
+  
+  write("接收到请求: 34 00 31 20 20 20 10");
+  
+  // 解析请求参数
+  // 0x31 表示: 地址3字节，大小1字节
+  // 地址: 0x20 0x20 0x20 (3字节) = 0x202020
+  memoryAddress = 0;
+  memoryAddress = (memoryAddress << 8) | rawData[4];  // 0x20
+  memoryAddress = (memoryAddress << 8) | rawData[5];  // 0x20
+  memoryAddress = (memoryAddress << 8) | rawData[6];  // 0x20
+  
+  // 大小: 0x10 (1字节) = 16字节
+  dataSize = rawData[7];
+  
+  write("地址解析: 0x%08X (3字节)", memoryAddress);
+  write("大小解析: %d字节 (1字节)", dataSize);
+  
+  // 跳过内存范围检查，直接接受请求
+  write("跳过内存范围检查，直接接受请求");
+  
+  // 开始下载流程
+  downloadInProgress = 1;
+  transferredSize = 0;
+  blockSequenceCounter = 1;  // 从1开始
+  
+  write("*** 下载请求已接受 ***");
+  write("内存地址: 0x%08X", memoryAddress);
+  write("数据大小: %d 字节", dataSize);
+  write("最大块长度: %d 字节", (maxBlockLengthHigh << 8) | maxBlockLengthLow);
+  
+  // 构建正响应: 74 [最大块长度高] [最大块长度低]
+  responseData[0] = 0x74;  // SID+0x40
+  responseData[1] = maxBlockLengthHigh;
+  responseData[2] = maxBlockLengthLow;
+  
+  sendIsoTpPositiveResponse(responseData, 3);
+  write("34服务响应: 74 %02X %02X (最大块长度=%d)", 
+        maxBlockLengthHigh, maxBlockLengthLow, (maxBlockLengthHigh << 8) | maxBlockLengthLow);
+}
+
+// ========== 36服务 - 传输数据 (需要解锁) ==========
+void handleTransferData()
+{
+  write(">>> 处理36服务 - 传输数据");
+  
+  // 检查安全访问是否已解锁
+  if (securityUnlocked == 0) {
+    write("36服务: 安全访问未解锁，拒绝执行");
+    sendIsoTpNegativeResponse(SID_TRANSFER_DATA, NRC_SECURITY_ACCESS_DENIED);
+    return;
+  }
+  
+  if (dataLength < 2) {
+    write("36服务错误: 数据长度不足");
+    sendIsoTpNegativeResponse(SID_TRANSFER_DATA, NRC_INCORRECT_MESSAGE_LENGTH);
+    return;
+  }
+  
+  // 检查是否在下载会话中
+  if (downloadInProgress == 0) {
+    write("36服务错误: 没有活动的下载会话");
+    sendIsoTpNegativeResponse(SID_TRANSFER_DATA, NRC_CONDITIONS_NOT_CORRECT);
+    return;
+  }
+  
+  // 获取块序列号
+  blockSequenceNumber = rawData[2];
+  write("36服务: 块序列号=%d, 传输模式=下载", blockSequenceNumber);
+  
+  // 检查块序列号
+  if (blockSequenceNumber != blockSequenceCounter) {
+    write("36服务错误: 块序列号错误，预期=%d，收到=%d", 
+          blockSequenceCounter, blockSequenceNumber);
+    sendIsoTpNegativeResponse(SID_TRANSFER_DATA, NRC_CONDITIONS_NOT_CORRECT);
+    return;
+  }
+  
+  // 计算本块数据大小
+  blockDataSize = dataLength - 2;  // 减去SID和块序列号
+  
+  if (blockDataSize > 0) {
+    // 检查是否会超出总数据大小
+    if (transferredSize + blockDataSize > dataSize) {
+      write("36服务错误: 数据块超出总大小限制 (已接收=%d, 本块=%d, 总大小=%d)", 
+            transferredSize, blockDataSize, dataSize);
+      sendIsoTpNegativeResponse(SID_TRANSFER_DATA, NRC_REQUEST_OUT_OF_RANGE);
+      return;
+    }
+    
+    // 复制数据到缓冲区
+    for(i = 0; i < blockDataSize; i++) {
+      dataBuffer[transferredSize + i] = rawData[3 + i];
+    }
+    
+    write("下载块 %d: 接收 %d 字节数据", blockSequenceNumber, blockDataSize);
+    
+    // 打印前几个字节作为示例
+    if (blockDataSize >= 2) {
+      write("数据示例: %02X %02X", rawData[3], rawData[4]);
+    }
+    
+    transferredSize = transferredSize + blockDataSize;
+  } else {
+    write("下载块 %d: 无数据 (长度为0)", blockSequenceNumber);
+  }
+  
+  blockSequenceCounter = (blockSequenceCounter % 0xFF) + 1;
+  
+  // 构建正响应: 76 [块序列号]
+  responseData[0] = 0x76;  // SID+0x40
+  responseData[1] = blockSequenceNumber;
+  
+  sendIsoTpPositiveResponse(responseData, 2);
+  write("36服务响应: 76 %02X", blockSequenceNumber);
+  write("接收进度: %d/%d 字节 (%.1f%%)", 
+        transferredSize, dataSize, (transferredSize * 100.0) / dataSize);
+}
+
+// ========== 37服务 - 请求退出传输 (需要解锁) ==========
+void handleRequestTransferExit()
+{
+  write(">>> 处理37服务 - 请求退出传输");
+  
+  // 检查安全访问是否已解锁
+  if (securityUnlocked == 0) {
+    write("37服务: 安全访问未解锁，拒绝执行");
+    sendIsoTpNegativeResponse(SID_REQUEST_TRANSFER_EXIT, NRC_SECURITY_ACCESS_DENIED);
+    return;
+  }
+  
+  if (downloadInProgress == 0) {
+    write("37服务错误: 没有活动的传输会话");
+    sendIsoTpNegativeResponse(SID_REQUEST_TRANSFER_EXIT, NRC_CONDITIONS_NOT_CORRECT);
+    return;
+  }
+  
+  // 下载完成，将数据写入模拟内存
+  if (transferredSize > 0) {
+    // 跳过内存范围检查，直接写入
+    write("*** 下载完成: %d字节数据已写入内存地址0x%08X ***", 
+          transferredSize, memoryAddress);
+    write("注意: 跳过内存范围检查，数据可能写入到无效地址");
+  } else {
+    write("*** 下载完成: 无数据写入 (大小为0字节) ***");
+  }
+  
+  // 结束传输会话
+  downloadInProgress = 0;
+  
+  // 构建正响应: 77
+  responseData[0] = 0x77;  // SID+0x40
+  
+  sendIsoTpPositiveResponse(responseData, 1);
+  write("37服务响应: 77");
+  write("*** 传输会话已结束 ***");
+}
+
+// ========== 其他服务处理函数 ==========
+void handleECUReset()
+{
+  if (dataLength < 2) {
+    sendIsoTpNegativeResponse(0x11, NRC_INCORRECT_MESSAGE_LENGTH);
+    return;
+  }
+  subFunction = rawData[2];
+  write("处理ECU复位: 0x%02X", subFunction);
+  responseData[0] = 0x51;
+  responseData[1] = subFunction;
+  responseLen = 2;
+  sendIsoTpPositiveResponse(responseData, responseLen);
+}
+
+void handleTesterPresent()
+{
+  sessionActive = 1;
+  cancelTimer(sessionTimer);
+  setTimer(sessionTimer, SESSION_TIMEOUT_MS);
+  if (dataLength >= 2 && (rawData[2] & 0x80) == 0) {
+    responseData[0] = 0x7E;
+    responseData[1] = 0x00;
+    responseLen = 2;
+    sendIsoTpPositiveResponse(responseData, responseLen);
+  }
+}
+
+// ========== ISO-TP传输函数 (完整多帧支持) ==========
+void sendIsoTpPositiveResponse(byte data[], int dataLength)
+{
+  if (dataLength <= 7) {
+    // 单帧传输
+    sendIsoTpPositiveResponseSingleFrame(data, dataLength);
+  } else {
+    // 多帧传输
+    sendIsoTpPositiveResponseMultiFrame(data, dataLength);
+  }
+}
+
+void sendIsoTpPositiveResponseSingleFrame(byte data[], int dataLength)
+{
+  message 0x601 respMsg;
+  respMsg.dlc = 8;
+  
+  if (dataLength <= 7) {
+    respMsg.byte(0) = dataLength;
+    for(i = 0; i < dataLength; i++) {
+      respMsg.byte(i + 1) = data[i];
+    }
+    for(i = dataLength + 1; i < 8; i++) {
+      respMsg.byte(i) = 0x00;
+    }
+  } else {
+    write("错误: 单帧数据长度 %d > 7，无法发送", dataLength);
+    return;
+  }
+  
+  output(respMsg);
+  write("发送单帧响应: 长度=%d字节", dataLength);
+}
+
+void sendIsoTpPositiveResponseMultiFrame(byte data[], int totalLength)
+{
+  write("开始多帧传输，总长度: %d字节", totalLength);
+  
+  if (totalLength > 4095) {
+    write("错误: 数据长度 %d > 4095，超出ISO-TP限制", totalLength);
+    return;
+  }
+  
+  // 保存数据到缓冲区
+  pendingMultiFrameLen = totalLength;
+  for(i = 0; i < totalLength; i++) {
+    pendingMultiFrameData[i] = data[i];
+  }
+  pendingMultiFrameIndex = 0;
+  consecutiveFrameNumber = 1;
+  flowControlReceived = 0;
+  
+  // 发送第一帧
+  sendFirstFrame();
+}
+
+void sendFirstFrame()
+{
+  message 0x601 firstFrame;
+  firstFrame.dlc = 8;
+  
+  // 第一帧格式: 1x [长度高4位] [长度低8位] [数据0-5]
+  pci = 0x10 | ((pendingMultiFrameLen >> 8) & 0x0F);
+  firstFrame.byte(0) = pci;
+  firstFrame.byte(1) = pendingMultiFrameLen & 0xFF;
+  
+  // 复制数据 (最多6字节)
+  copyCount = (pendingMultiFrameLen > 6) ? 6 : pendingMultiFrameLen;
+  for(i = 0; i < copyCount; i++) {
+    firstFrame.byte(2 + i) = pendingMultiFrameData[i];
+  }
+  
+  // 填充剩余字节
+  for(i = 2 + copyCount; i < 8; i++) {
+    firstFrame.byte(i) = 0x00;
+  }
+  
+  pendingMultiFrameIndex = copyCount;
+  output(firstFrame);
+  
+  write("发送第一帧: PCI=0x%02X, 总长度=%d, 本帧数据=%d字节", 
+        pci, pendingMultiFrameLen, copyCount);
+  
+  // 设置流控制定时器
+  setTimer(flowControlTimer, 10);
+}
+
+void sendConsecutiveFrames()
+{
+  while (pendingMultiFrameIndex < pendingMultiFrameLen) {
+    message 0x601 conFrame;
+    conFrame.dlc = 8;
+    
+    // 连续帧格式: 2x [序列号] [数据0-6]
+    conFrame.byte(0) = 0x20 | (consecutiveFrameNumber & 0x0F);
+    
+    // 计算本帧可发送的数据量
+    bytesToSend = pendingMultiFrameLen - pendingMultiFrameIndex;
+    if (bytesToSend > 7) bytesToSend = 7;
+    
+    // 复制数据
+    for(i = 0; i < bytesToSend; i++) {
+      conFrame.byte(1 + i) = pendingMultiFrameData[pendingMultiFrameIndex + i];
+    }
+    
+    // 填充剩余字节
+    for(i = 1 + bytesToSend; i < 8; i++) {
+      conFrame.byte(i) = 0x00;
+    }
+    
+    pendingMultiFrameIndex += bytesToSend;
+    consecutiveFrameNumber = (consecutiveFrameNumber % 0x0F) + 1;
+    
+    output(conFrame);
+    write("发送连续帧 %d: 数据=%d字节, 进度=%d/%d", 
+          consecutiveFrameNumber - 1, bytesToSend, pendingMultiFrameIndex, pendingMultiFrameLen);
+    
+    if (pendingMultiFrameIndex >= pendingMultiFrameLen) {
+      // 传输完成
+      pendingMultiFrameLen = 0;
+      pendingMultiFrameIndex = 0;
+      write("多帧传输完成");
+      break;
+    }
+    
+    // 每发送一帧后等待流控制
+    if (!flowControlReceived) {
+      write("等待流控制帧...");
+      break;
+    }
+  }
+}
+
+on timer flowControlTimer
+{
+  if (pendingMultiFrameLen > 0) {
+    if (!flowControlReceived) {
+      // 模拟接收流控制帧 (继续发送)
+      flowControlReceived = 1;
+      write("收到流控制帧: 继续发送");
+      sendConsecutiveFrames();
+    }
+  }
+}
+
+void sendIsoTpNegativeResponse(byte failedSID, byte nrcCode)
+{
+  responseData[0] = 0x7F;  // 负响应SID
+  responseData[1] = failedSID;
+  responseData[2] = nrcCode;
+  sendIsoTpPositiveResponse(responseData, 3);
+  write("发送负响应: 7F %02X %02X", failedSID, nrcCode);
+}
+
+// ========== 定时器处理 ==========
+on timer sessionTimer 
+{
+  if (!sessionActive) {
+    if (currentSession != DEFAULT_SESSION) {
+      write("会话超时，自动切换回默认会话");
+      currentSession = DEFAULT_SESSION;
+    }
+  } else {
+    sessionActive = 0;
+  }
+  setTimer(sessionTimer, SESSION_TIMEOUT_MS);
+}
+
+// ========== 主消息处理函数 ==========
+on message 0x701 
+{
+   // ===== 处理 ISO-TP First Frame (FF) =====
+  if ((this.byte(0) & 0xF0) == 0x10) {
+    word totalLen;
+    byte copyLen;
+    totalLen = ((this.byte(0) & 0x0F) << 8) | this.byte(1);
+    if (totalLen > 255) {
+      sendIsoTpNegativeResponse(0x2E, NRC_INCORRECT_MESSAGE_LENGTH);
+      return;
+    }
+    tpRxTotalLen = totalLen;
+    tpRxIndex = 0;
+    tpRxExpectedSN = 1;
+    tpRxInProgress = 1;
+    // FF带6字节payload: byte2..byte7
+    copyLen = (tpRxTotalLen > 6) ? 6 : tpRxTotalLen;
+    for (i = 0; i < copyLen; i++) {
+      tpRxBuffer[i] = this.byte(2 + i);
+    }
+    tpRxIndex = copyLen;
+    write("RX FF: totalLen=%d, firstPayload=%d", tpRxTotalLen, tpRxIndex);
+    // ECU作为接收方，发FC
+    sendFlowControlCTS();
+    // 若刚好收完
+    if (tpRxIndex >= tpRxTotalLen) {
+      tpRxInProgress = 0;
+      handle2EF190FromTpBuffer();
+    }
+    return;
+  }
+  // ===== 处理 ISO-TP Consecutive Frame (CF) =====
+  if ((this.byte(0) & 0xF0) == 0x20 && tpRxInProgress) {
+    byte sn;
+    byte bytesLeft;
+    byte copyLen;
+    sn = this.byte(0) & 0x0F;
+    if (sn != (tpRxExpectedSN & 0x0F)) {
+      write("RX CF SN mismatch: exp=%d got=%d", tpRxExpectedSN & 0x0F, sn);
+      tpRxInProgress = 0;
+      sendIsoTpNegativeResponse(0x2E, NRC_CONDITIONS_NOT_CORRECT);
+      return;
+    }
+    bytesLeft = tpRxTotalLen - tpRxIndex;
+    copyLen = (bytesLeft > 7) ? 7 : bytesLeft;
+    for (i = 0; i < copyLen; i++) {
+      tpRxBuffer[tpRxIndex + i] = this.byte(1 + i);
+    }
+    tpRxIndex += copyLen;
+    tpRxExpectedSN = (tpRxExpectedSN + 1) & 0x0F;
+    if (tpRxExpectedSN == 0) tpRxExpectedSN = 1;
+    write("RX CF: copied=%d, progress=%d/%d", copyLen, tpRxIndex, tpRxTotalLen);
+    if (tpRxIndex >= tpRxTotalLen) {
+      tpRxInProgress = 0;
+      handle2EF190FromTpBuffer();
+    }
+    return;
+  }
+  // 检查通信控制状态
+  if (communicationControlState == 3) {
+    // 特殊处理：28 00服务总是允许执行
+    for(i = 0; i < this.dlc && i < 8; i++) {
+      rawData[i] = this.byte(i);
+    }
+    if (this.dlc >= 3 && rawData[1] == 0x28 && (rawData[2] & 0x7F) == 0x00) {
+      write("检测到28 00服务，允许恢复通信");
+      sessionActive = 1;
+      handleCommunicationControl();
+      return;
+    }
+    write("通信被28服务禁止，忽略请求");
+    return;
+  }
+  
+  // 获取原始数据
+  for(i = 0; i < this.dlc && i < 8; i++) {
+    rawData[i] = this.byte(i);
+  }
+  
+  // 检查最小长度
+  if (this.dlc < 2) {
+    return;
+  }
+  
+  // 解析长度前缀
+  dataLength = rawData[0];
+  
+  // 验证长度是否匹配
+  if (dataLength + 1 > this.dlc) {
+    sendIsoTpNegativeResponse(0x10, NRC_INCORRECT_MESSAGE_LENGTH);
+    return;
+  }
+  
+  // 提取UDS服务ID
+  udsService = rawData[1];
+  
+  write("收到请求: 服务=0x%02X, 长度=%d", udsService, dataLength);
+  
+  // 重置会话活跃标志
+  sessionActive = 1;
+  
+  // 根据服务ID分发处理
+  switch (udsService) {
+    case 0x10: handleSessionControl(); break;        // 诊断会话控制
+    case 0x11: handleECUReset(); break;             // ECU复位
+    case 0x14: handleClearDiagnosticInformation(); break; // 清除诊断信息
+    case 0x19: handleReadDTCInformation(); break;    // 读取DTC信息
+    case 0x22: handleReadDataByIdentifier(); break; // 按标识符读数据
+    case 0x27: handleSecurityAccess(); break;        // 安全访问
+    case 0x28: handleCommunicationControl(); break; // 通信控制
+    case 0x2E: handleWriteDataByIdentifier(); break; // 按标识符写数据
+    case 0x31: handleRoutineControl(); break;       // 例程控制
+    case 0x34: handleRequestDownload(); break;       // 请求下载
+    case 0x36: handleTransferData(); break;         // 传输数据
+    case 0x37: handleRequestTransferExit(); break; // 请求退出传输
+    case 0x3E: handleTesterPresent(); break;        // Tester Present
+    default: sendIsoTpNegativeResponse(udsService, NRC_SERVICE_NOT_SUPPORTED); break;
+  }
+}
