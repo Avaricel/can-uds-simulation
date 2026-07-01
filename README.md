@@ -39,7 +39,31 @@ python examples/demo.py
 
 ---
 
-### 3. [auto-test-cli/](./auto-test-cli/) — 车载测试自动化 CLI (Python)
+### 3. [can-toolkit/](./can-toolkit/) — CAN 总线工具包 (python-can) 🆕
+
+基于 **python-can** 库的车载 CAN 总线工具集，支持真实 CAN 硬件和虚拟接口。
+
+| 技术 | 内容 |
+|------|------|
+| 语言 | Python 3 |
+| 核心依赖 | python-can >= 4.0 |
+| 核心能力 | 双总线收发、ASC/CSV/SQLite 日志、实时监控、日志回放、报文过滤、UDS 诊断 |
+| 代码量 | 1850+ 行 |
+
+```bash
+# 安装依赖
+pip install python-can
+
+# 运行完整演示 (无需硬件)
+cd can-toolkit
+python cli.py demo
+```
+
+**支持的 CAN 硬件**: SocketCAN / PCAN / Vector / SLCAN / Kvaser / Virtual
+
+---
+
+### 4. [auto-test-cli/](./auto-test-cli/) — 车载测试自动化 CLI (Python)
 
 车载测试命令行工具，集成 UDS 诊断、CAN 监控、测试用例管理、HTML 报告生成。
 
@@ -57,7 +81,7 @@ python cli.py
 
 ---
 
-### 4. [vehicle-signal-simulator/](./vehicle-signal-simulator/) — 车辆信号仿真器 (Python)
+### 5. 车辆信号仿真器 (Python)
 
 模拟发动机、变速箱、车身等 ECU 信号并通过 CAN 输出，支持故障注入。
 
